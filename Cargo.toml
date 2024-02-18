@@ -1,0 +1,11 @@
+[package]
+name = "llama2_rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = { version = "1.0.79", features = ["backtrace"] }
+bytemuck = "1.14.3"
+memmap = "0.7.0"
