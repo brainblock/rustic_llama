@@ -20,7 +20,7 @@ impl Sampler {
     fn sample_argmax(&self, probabilities: &[f32]) -> usize {
         // return the index that has the highest probability
         let mut max_i = 0;
-        let mut max_p = probabilities[0];
+        let mut max_p = probabilities.get(0).unwrap_or(&0f32).to_owned();
 
         for i in 0..probabilities.len() {
             if probabilities[i] > max_p {

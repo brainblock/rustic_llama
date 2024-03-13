@@ -1,10 +1,11 @@
-use memmap::MmapOptions;
+use memmap2::MmapOptions;
 
 use anyhow::{Ok, Result};
-use bytemuck::{from_bytes, Pod};
+use regex::Regex;
 use std::io::{Cursor, Read};
-use std::mem::{self};
 use std::{fs::File, path::PathBuf};
+
+use crate::utils::read_value;
 
 struct TokenIndex {
     str: String,
@@ -15,7 +16,7 @@ pub struct Tokenizer {
     vocab: Vec<String>,
     sorted_vocab: Vec<TokenIndex>,
     vocab_scores: Vec<f32>,
-    // byte_pieces: Vec<String>,
+    byte_pieces: Vec<String>,
     // max_token_length: usize,
 }
 
@@ -34,8 +35,8 @@ impl Tokenizer {
 
         let _max_token_length = read_value::<i32>(&mut buf)? as usize;
 
-        for i in 0..256 {
-            byte_pieces.push(format!("{}", i))
+        for i in 0..255u8 {
+            byte_pieces.push(format!("{}", i as char))
         }
 
         for i in 0..vocab_size {
@@ -60,26 +61,30 @@ impl Tokenizer {
         Ok(Tokenizer {
             vocab,
             vocab_scores,
-            // byte_pieces,
+            byte_pieces,
             sorted_vocab,
             // max_token_length,
         })
     }
 
-    pub fn decode(&self, prev_token: usize, token: usize) -> String {
-        let mut piece = self.vocab[token].clone();
+    pub fn decode(&self, prev_token: usize, token: usize) -> &str {
+        let mut piece: &str = &self.vocab[token];
         if prev_token == 1 && piece.starts_with(" ") {
-            piece = piece.replace(" ", "");
+            piece = piece.trim_start();
         }
 
         if piece.contains("<0x") {
-            todo!("token with raw bytes")
+            let re = Regex::new(r"<0x(.+)>$").unwrap();
+            let captured = re.captures(&piece).take().unwrap();
+            let byte_val = captured.get(1).unwrap();
+            let byte_val: u8 = u8::from_str_radix(byte_val.as_str(), 16).unwrap();
+            piece = &self.byte_pieces[byte_val as usize];
         }
 
         piece
     }
 
-    pub fn encode(&self, text: &str, bos: bool,  eos: bool) -> Result<Vec<usize>> {
+    pub fn encode(&self, text: &str, bos: bool, eos: bool) -> Result<Vec<usize>> {
         let mut tokens = Vec::with_capacity(text.len());
 
         // add optional BOS (=1) token, if desired
@@ -88,7 +93,7 @@ impl Tokenizer {
         }
 
         if text.chars().nth(0) != Some('\0') {
-            let dummy_prefix = self.str_lookup(" ").expect("dummy prefix not found");
+            let dummy_prefix = self.str_lookup(" ").expect("dummy prefix");
 
             tokens.push(dummy_prefix);
         }
@@ -107,7 +112,7 @@ impl Tokenizer {
             idx: usize,
         }
         loop {
-            let mut best_score = -f32::INFINITY;
+            let mut best_score = f32::NEG_INFINITY;
 
             let mut best: Option<BestScore> = None;
 
@@ -135,10 +140,6 @@ impl Tokenizer {
             tokens.push(2);
         }
 
-        for token in &tokens {
-            println!("token: {}\t str: {:?}", token, self.vocab[*token]);
-        }
-
         Ok(tokens)
     }
 
@@ -147,14 +148,6 @@ impl Tokenizer {
             .binary_search_by(|probe| probe.str.as_str().cmp(str))
             .map(|result| self.sorted_vocab[result].id)
     }
-}
-
-fn read_value<T: Pod>(reader: &mut impl Read) -> Result<T> {
-    let size = mem::size_of::<T>();
-    let mut bytes: Vec<u8> = vec![0u8; size];
-    reader.read(bytes.as_mut_slice())?;
-    let val = from_bytes(&bytes);
-    Ok(*val)
 }
 
 #[cfg(test)]
