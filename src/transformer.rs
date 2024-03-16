@@ -175,7 +175,8 @@ impl TransformerWeights {
         self.wcls.aligned(self.mmap.as_ref())
     }
 }
-struct RunState {
+/// buffers for the "wave" of activations in the forward pass
+pub struct RunState {
     // current wave of activations
     x: Vec<f32>,   // activation at current time stamp (dim,)
     xb: Vec<f32>,  // same, but inside a residual branch (dim,)
@@ -194,7 +195,6 @@ struct RunState {
 pub struct Transformer {
     config: Config,              // the hyperparameters of the architecture (the blueprint)
     weights: TransformerWeights, // the weights of the model
-    state: RunState,             // buffers for the "wave" of activations in the forward pass
 }
 
 impl Config {
@@ -219,7 +219,6 @@ impl Transformer {
         let mut cursor = Cursor::new(reader);
 
         let config = Config::from_read(&mut cursor)?;
-        let state = RunState::new(&config);
 
         let start = cursor.position() as usize;
         let weights = TransformerWeights::from_bytes(&config, f, start)?;
@@ -227,159 +226,18 @@ impl Transformer {
         Ok(Self {
             config,
             weights,
-            state,
         })
     }
 
-    pub fn forward(&mut self, token: usize, pos: usize) -> &[f32] {
-        let p = &self.config;
-        let w = &self.weights;
-        let s = &mut self.state;
-
-        let dim = p.dim;
-        let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
-        let kv_mul = p.n_heads / p.n_kv_heads;
-        let hidden_dim = p.hidden_dim;
-        let head_size = dim / p.n_heads;
-        s.x.copy_from_slice(&w.token_embedding_table()[token * dim..(token + 1) * dim]);
-        let x = &mut s.x[..];
-
-        for l in 0..p.n_layers {
-            rmsnorm(&mut s.xb, x, &w.rms_att_weight()[l * dim..(l + 1) * dim]);
-
-            // key and value point to the kv cache
-            let loff = l * p.seq_len * kv_dim; // kv cache layer offset for convenience
-            {
-                let mut q = &mut s.q[..];
-                let mut k = &mut s.key_cache[loff + pos * kv_dim..loff + dim + pos * kv_dim];
-                let mut v = &mut s.value_cache[loff + pos * kv_dim..loff + dim + pos * kv_dim];
-                let wq = &w.wq()[l * dim * dim..(l + 1) * dim * dim];
-                let wk = &w.wk()[l * dim * kv_dim..(l + 1) * dim * kv_dim];
-                let wv = &w.wv()[l * dim * kv_dim..(l + 1) * dim * kv_dim];
-                // let k = &s.key_cache[ loff + pos * kv_dim];
-
-                // s.v = s.value_cache + loff + pos * kv_dim;
-                matmul(&mut q, &s.xb, &wq);
-                matmul(&mut k, &s.xb, &wk);
-                matmul(&mut v, &s.xb, &wv);
-
-                // RoPE relative positional encoding: complex-valued rotate q and k in each head
-                for i in (0..dim).step_by(2) {
-                    let head_dim = i % head_size;
-                    let freq = 1.0f32 / 10000.0f32.powf(head_dim as f32 / head_size as f32);
-                    let val = pos as f32 * freq;
-                    let fcr = val.cos();
-                    let fci = val.sin();
-                    let rotn = if i < kv_dim { 2 } else { 1 }; // how many vectors? 2 = q & k, 1 = q only
-                    for v in 0..rotn {
-                        let vec = if v == 0 { &mut q } else { &mut k }; // the vector to rotate (query or key)
-                        let v0 = vec[i];
-                        let v1 = vec[i + 1];
-                        vec[i] = v0 * fcr - v1 * fci;
-                        vec[i + 1] = v0 * fci + v1 * fcr;
-                    }
-                }
-            }
-            // multihead attention. iterate over all heads
-            for h in 0..p.n_heads {
-                // get the query vector for this head
-                let q = &mut s.q[h * head_size..(h + 1) * head_size];
-                // attention scores for this head
-                let att = &mut s.att[h * p.seq_len..h * p.seq_len + pos + 1];
-                // iterate over all timesteps, including the current one
-                for t in 0..(pos + 1) {
-                    // get the key vector for this head and at this timestep
-                    let start_slice = loff + t * kv_dim + (h / kv_mul) * head_size;
-                    let end_slice = start_slice + head_size;
-                    let k = &mut s.key_cache[start_slice..end_slice];
-
-                    // calculate the attention score as the dot product of q and k
-                    let mut score = 0.0f32;
-                    for i in 0..head_size {
-                        score += q[i] * k[i];
-                    }
-                    score /= (head_size as f32).sqrt();
-                    // save the score to the attention buffer
-                    att[t] = score;
-                }
-                softmax(att, pos + 1);
-
-                // weighted sum of the values, store back into xb
-                let xb = &mut s.xb[h * head_size..(h + 1) * head_size];
-                xb.fill(0f32);
-                for t in 0..pos + 1 {
-                    // get the value vector for this head and at this timestep
-                    let start_slice = loff + t * kv_dim + (h / kv_mul) * head_size;
-                    let end_slice = start_slice + head_size;
-                    let v = &mut s.value_cache[start_slice..end_slice];
-
-                    // get the attention weight for this timestep
-                    let a = att[t];
-                    // accumulate the weighted value into xb
-                    for i in 0..head_size {
-                        xb[i] += a * v[i];
-                    }
-                }
-            }
-            // final matmul to get the output of the attention
-
-            let wo = &w.wo()[l * dim * dim..(l + 1) * dim * dim];
-            matmul(&mut s.xb2[..], &s.xb[..], &wo);
-
-            // residual connection back into x
-            for i in 0..dim {
-                x[i] += s.xb2[i];
-            }
-            // ffn rmsnorm
-            rmsnorm(
-                &mut s.xb[..],
-                x,
-                &w.rms_ffn_weight()[l * dim..(l + 1) * dim],
-            );
-
-            // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-            // first calculate self.w1(x) and self.w3(x)
-            matmul(
-                &mut s.hb[..],
-                &s.xb[..],
-                &w.w1()[l * dim * hidden_dim..(l + 1) * dim * hidden_dim],
-            );
-            matmul(
-                &mut s.hb2[..],
-                &s.xb[..],
-                &w.w3()[l * dim * hidden_dim..(l + 1) * dim * hidden_dim],
-            );
-
-            // SwiGLU non-linearity
-            for i in 0..hidden_dim {
-                let mut val = s.hb[i];
-                // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-                val *= 1.0f32 / (1.0f32 + (-val).exp());
-                // elementwise multiply with w3(x)
-                val *= s.hb2[i];
-                s.hb[i] = val;
-            }
-
-            // final matmul to get the output of the ffn
-            matmul(
-                &mut s.xb[..],
-                &s.hb[..],
-                &w.w2()[l * dim * hidden_dim..(l + 1) * dim * hidden_dim],
-            );
-
-            // residual connection
-            for i in 0..dim {
-                x[i] += s.xb[i];
-            }
-        }
-        // final rmsnorm
-        rmsnorm_self(x, &w.rms_final_weight()[..]);
-
-        // classifier into logits
-        matmul(&mut s.logits[..], x, &w.wcls()[..]);
-
-        &s.logits
+    pub fn config(&self) -> &Config {
+        &self.config
     }
+    
+    pub fn weights(&self) -> &TransformerWeights {
+        &self.weights
+    }
+
+
 }
 
 impl RunState {
@@ -398,6 +256,175 @@ impl RunState {
             logits: vec![0f32; config.vocab_size],
             key_cache: vec![0f32; config.n_layers * config.seq_len * kv_dim],
             value_cache: vec![0f32; config.n_layers * config.seq_len * kv_dim],
+        }
+    }
+
+    pub fn forward(&mut self, token: usize, pos: usize, p: &Config, w: &TransformerWeights) -> &[f32] {
+
+        let dim = p.dim;
+        let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+        let kv_mul = p.n_heads / p.n_kv_heads;
+        let hidden_dim = p.hidden_dim;
+        let head_size = dim / p.n_heads;
+
+        let token_emb = &w.token_embedding_table()[token * dim..(token + 1) * dim];
+        self.x.copy_from_slice(token_emb);
+
+
+        for l in 0..p.n_layers {
+            rmsnorm(&mut self.xb, &self.x[..], &w.rms_att_weight()[l * dim..(l + 1) * dim]);
+
+            // key and value point to the kv cache
+            let loff = l * p.seq_len * kv_dim; // kv cache layer offset for convenience
+            self.qkv(l, pos, p, w);
+        
+            self.rope_rotation(l, pos, p);
+
+            // multihead attention. iterate over all heads
+            for h in 0..p.n_heads {
+                // get the query vector for this head
+                let q = &mut self.q[h * head_size..(h + 1) * head_size];
+                // attention scores for this head
+                let att = &mut self.att[h * p.seq_len..h * p.seq_len + pos + 1];
+                // iterate over all timesteps, including the current one
+                for t in 0..(pos + 1) {
+                    // get the key vector for this head and at this timestep
+                    let start_slice = loff + t * kv_dim + (h / kv_mul) * head_size;
+                    let end_slice = start_slice + head_size;
+                    let k = &mut self.key_cache[start_slice..end_slice];
+
+                    // calculate the attention score as the dot product of q and k
+                    let mut score = 0.0f32;
+                    for i in 0..head_size {
+                        score += q[i] * k[i];
+                    }
+                    score /= (head_size as f32).sqrt();
+                    // save the score to the attention buffer
+                    att[t] = score;
+                }
+                softmax(att, pos + 1);
+
+                // weighted sum of the values, store back into xb
+                let xb = &mut self.xb[h * head_size..(h + 1) * head_size];
+                xb.fill(0f32);
+                for t in 0..pos + 1 {
+                    // get the value vector for this head and at this timestep
+                    let start_slice = loff + t * kv_dim + (h / kv_mul) * head_size;
+                    let end_slice = start_slice + head_size;
+                    let v = &mut self.value_cache[start_slice..end_slice];
+
+                    // get the attention weight for this timestep
+                    let a = att[t];
+                    // accumulate the weighted value into xb
+                    for i in 0..head_size {
+                        xb[i] += a * v[i];
+                    }
+                }
+            }
+            // final matmul to get the output of the attention
+
+            let wo = &w.wo()[l * dim * dim..(l + 1) * dim * dim];
+            matmul(&mut self.xb2[..], &self.xb[..], &wo);
+
+            // residual connection back into x
+            for i in 0..dim {
+                self.x[i] += self.xb2[i];
+            }
+            // ffn rmsnorm
+            rmsnorm(
+                &mut self.xb[..],
+                &self.x[..],
+                &w.rms_ffn_weight()[l * dim..(l + 1) * dim],
+            );
+
+            // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
+            // first calculate self.w1(x) and self.w3(x)
+            matmul(
+                &mut self.hb[..],
+                &self.xb[..],
+                &w.w1()[l * dim * hidden_dim..(l + 1) * dim * hidden_dim],
+            );
+            matmul(
+                &mut self.hb2[..],
+                &self.xb[..],
+                &w.w3()[l * dim * hidden_dim..(l + 1) * dim * hidden_dim],
+            );
+
+            // SwiGLU non-linearity
+            for i in 0..hidden_dim {
+                let mut val = self.hb[i];
+                // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+                val *= 1.0f32 / (1.0f32 + (-val).exp());
+                // elementwise multiply with w3(x)
+                val *= self.hb2[i];
+                self.hb[i] = val;
+            }
+
+            // final matmul to get the output of the ffn
+            matmul(
+                &mut self.xb[..],
+                &self.hb[..],
+                &w.w2()[l * dim * hidden_dim..(l + 1) * dim * hidden_dim],
+            );
+
+            // residual connection
+            for i in 0..dim {
+                self.x[i] += self.xb[i];
+            }
+        }
+        // final rmsnorm
+        rmsnorm_self(&mut self.x[..], &w.rms_final_weight()[..]);
+
+        // classifier into logits
+        matmul(&mut self.logits[..], &self.x[..], &w.wcls()[..]);
+
+        &self.logits
+    }
+
+    fn qkv(&mut self, l: usize, pos: usize, p: &Config, w: &TransformerWeights) {
+        let dim = p.dim;
+        let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+        
+        // key and value point to the kv cache
+        let loff = l * p.seq_len * kv_dim; // kv cache layer offset for convenience
+        let mut q = &mut self.q[..];
+        let mut k = &mut self.key_cache[loff + pos * kv_dim..loff + dim + pos * kv_dim];
+        let mut v = &mut self.value_cache[loff + pos * kv_dim..loff + dim + pos * kv_dim];
+        let wq = &w.wq()[l * dim * dim..(l + 1) * dim * dim];
+        let wk = &w.wk()[l * dim * kv_dim..(l + 1) * dim * kv_dim];
+        let wv = &w.wv()[l * dim * kv_dim..(l + 1) * dim * kv_dim];
+        // let k = &s.key_cache[ loff + pos * kv_dim];
+
+        // s.v = s.value_cache + loff + pos * kv_dim;
+        matmul(&mut q, &self.xb, &wq);
+        matmul(&mut k, &self.xb, &wk);
+        matmul(&mut v, &self.xb, &wv);
+    }
+
+    fn rope_rotation(&mut self, l: usize, pos: usize, p: &Config) {
+        let dim = p.dim;
+        let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+        let head_size = dim / p.n_heads;
+        // key and value point to the kv cache
+        let loff = l * p.seq_len * kv_dim; // kv cache layer offset for convenience
+        let mut q = &mut self.q[..];
+        let mut k = &mut self.key_cache[loff + pos * kv_dim..loff + dim + pos * kv_dim];
+
+        // RoPE relative positional encoding: complex-valued rotate q and k in each head
+        for i in (0..dim).step_by(2) {
+            let head_dim = i % head_size;
+            let freq = 1.0f32 / 10000.0f32.powf(head_dim as f32 / head_size as f32);
+            let val = pos as f32 * freq;
+            let fcr = val.cos();
+            let fci = val.sin();
+            let rotn = if i < kv_dim { 2 } else { 1 }; // how many vectors? 2 = q & k, 1 = q only
+            for v in 0..rotn {
+                let vec = if v == 0 { &mut q } else { &mut k }; // the vector to rotate (query or key)
+                let v0 = vec[i];
+                let v1 = vec[i + 1];
+                vec[i] = v0 * fcr - v1 * fci;
+                vec[i + 1] = v0 * fci + v1 * fcr;
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crate::{sampler::Sampler, tokenizer::Tokenizer, transformer::Transformer, utils::time_in_ms};
+use crate::{sampler::Sampler, tokenizer::Tokenizer, transformer::{RunState, Transformer}, utils::time_in_ms};
 use anyhow::Result;
 
 pub fn generate(
@@ -20,9 +20,10 @@ pub fn generate(
     let mut token = prompt_tokens[0usize]; // kick off with the first token in the prompt
     let mut pos = 0usize; // position in the sequence
     println!("============");
+    let mut state = RunState::new(transformer.config());
     while pos < steps {
         // forward the transformer to get logits for the next token
-        let logits = transformer.forward(token, pos);
+        let logits = state.forward(token, pos, transformer.config(), transformer.weights());
         // advance the state machine
         if pos < prompt_tokens.len() - 1 {
             // if we are still processing the input prompt, force the next prompt token
