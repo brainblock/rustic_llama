@@ -1,5 +1,5 @@
 [package]
-name = "llama2_rs"
+name = "rustic_llama"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,3 +10,6 @@ anyhow = { version = "1.0.79", features = ["backtrace"] }
 bytemuck = "1.14.3"
 memmap2 = "0.9.4"
 regex = "1.10.3"
+
+[profile.release]
+debug = true
