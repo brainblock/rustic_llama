@@ -1,10 +1,11 @@
 use std::io::Write;
 
-use crate::{sampler::Sampler, tokenizer::Tokenizer, transformer::{RunState, Transformer}, utils::time_in_ms};
+use crate::{sampler::Sampler, tokenizer::Tokenizer, utils::time_in_ms};
 use anyhow::Result;
+use rustic_llama::llama2::transformer::Transformer;
 
 pub fn generate(
-    transformer: &mut Transformer,
+    transformer: &Transformer,
     tokenizer: &Tokenizer,
     sampler: &Sampler,
     prompt: Option<&str>,
@@ -19,11 +20,10 @@ pub fn generate(
     let mut next: usize; // will store the next token in the sequence
     let mut token = prompt_tokens[0usize]; // kick off with the first token in the prompt
     let mut pos = 0usize; // position in the sequence
-    println!("============");
-    let mut state = RunState::new(transformer.config());
+    let mut state = transformer.create_run_state();
     while pos < steps {
         // forward the transformer to get logits for the next token
-        let logits = state.forward(token, pos, transformer.config(), transformer.weights());
+        let logits = state.forward(token, pos);
         // advance the state machine
         if pos < prompt_tokens.len() - 1 {
             // if we are still processing the input prompt, force the next prompt token
