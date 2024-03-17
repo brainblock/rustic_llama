@@ -1,9 +1,14 @@
+use datasize::{data_size, DataSize};
+
+use crate::ops::{accum, dotprod, elementwise_mult, matmul, rmsnorm, silu, softmax};
+
 use super::{config::Config, Llama2Weights};
 
 /// buffers for the "wave" of activations in the forward pass
 pub struct RunState<'a, W: Llama2Weights> {
     config: &'a Config,
     weights: &'a W,
+    pos: usize,
     // current wave of activations
     x: Vec<f32>,   // activation at current time stamp (dim,)
     xb: Vec<f32>,  // same, but inside a residual branch (dim,)
@@ -19,12 +24,37 @@ pub struct RunState<'a, W: Llama2Weights> {
     key_cache: Vec<f32>,   // (layer, seq_len, dim)
     value_cache: Vec<f32>, // (layer, seq_len, dim)
 }
+
+impl<'a, W: Llama2Weights> DataSize for RunState<'a, W> {
+    // `MyType` contains a `Vec`, so `IS_DYNAMIC` is set to true.
+    const IS_DYNAMIC: bool = true;
+
+    // The only always present heap item is the `counter` value, which is 8 bytes.
+    const STATIC_HEAP_SIZE: usize = 8;
+
+    #[inline]
+    fn estimate_heap_size(&self) -> usize {
+        // We can be lazy here and delegate to all the existing implementations:
+        data_size(&self.pos)
+            + data_size(&self.x)
+            + data_size(&self.xb)
+            + data_size(&self.xb2)
+            + data_size(&self.hb)
+            + data_size(&self.hb2)
+            + data_size(&self.q)
+            + data_size(&self.att)
+            + data_size(&self.logits)
+            + data_size(&self.key_cache)
+            + data_size(&self.value_cache)
+    }
+}
 impl<'a, W: Llama2Weights> RunState<'a, W> {
     pub fn new(config: &'a Config, weights: &'a W) -> Self {
         let kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
         Self {
             config,
             weights,
+            pos: 0usize,
             x: vec![0f32; config.dim],
             xb: vec![0f32; config.dim],
             xb2: vec![0f32; config.dim],
@@ -40,7 +70,7 @@ impl<'a, W: Llama2Weights> RunState<'a, W> {
         }
     }
 
-    pub fn forward(&mut self, token: usize, pos: usize) -> &[f32] {
+    pub fn forward(&mut self, token: usize) -> &mut [f32] {
         let p = self.config;
         let dim = p.dim;
         let w = self.weights;
@@ -56,24 +86,28 @@ impl<'a, W: Llama2Weights> RunState<'a, W> {
             );
 
             // key and value point to the kv cache
-            self.qkv(l, pos);
+            self.qkv(l);
 
-            self.rope_rotation(l, pos);
+            self.rope_rotation(l);
 
-            self.multihead_attention(l, pos);
+            self.multihead_attention(l);
 
             self.fnn(l);
         }
         // final rmsnorm
-        rmsnorm_self(&mut self.x[..], &w.rms_final_weight()[..]);
+        // rmsnorm_self(&mut self.x[..], &w.rms_final_weight()[..]);
+        self.xb2.copy_from_slice(&self.x); // Temp copy x to xb2, and used for rmsnorm below.
+        rmsnorm(&mut self.x[..], &self.xb2[..], w.rms_final_weight());
 
         // classifier into logits
         matmul(&mut self.logits[..], &self.x[..], &w.wcls()[..]);
+        self.pos += 1;
 
-        &self.logits
+        &mut self.logits
     }
 
-    fn qkv(&mut self, l: usize, pos: usize) {
+    fn qkv(&mut self, l: usize) {
+        let pos = self.pos;
         let p = self.config;
         let w = self.weights;
         let dim = p.dim;
@@ -95,7 +129,8 @@ impl<'a, W: Llama2Weights> RunState<'a, W> {
         matmul(&mut v, &self.xb, &wv);
     }
 
-    fn rope_rotation(&mut self, l: usize, pos: usize) {
+    fn rope_rotation(&mut self, l: usize) {
+        let pos = self.pos;
         let p = self.config;
         let dim = p.dim;
         let kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
@@ -122,7 +157,8 @@ impl<'a, W: Llama2Weights> RunState<'a, W> {
             }
         }
     }
-    fn multihead_attention(&mut self, l: usize, pos: usize) {
+    fn multihead_attention(&mut self, l: usize) {
+        let pos = self.pos;
         let p = self.config;
         let w = self.weights;
         let dim = p.dim;
@@ -144,15 +180,12 @@ impl<'a, W: Llama2Weights> RunState<'a, W> {
                 let k = &mut self.key_cache[start_slice..end_slice];
 
                 // calculate the attention score as the dot product of q and k
-                let mut score = 0.0f32;
-                for i in 0..head_size {
-                    score += q[i] * k[i];
-                }
+                let mut score = dotprod(q, k);
                 score /= (head_size as f32).sqrt();
                 // save the score to the attention buffer
                 att[t] = score;
             }
-            softmax(att, pos + 1);
+            softmax(att);
 
             // weighted sum of the values, store back into xb
             let xb = &mut self.xb[h * head_size..(h + 1) * head_size];
@@ -176,9 +209,7 @@ impl<'a, W: Llama2Weights> RunState<'a, W> {
         matmul(&mut self.xb2[..], &self.xb[..], &wo);
 
         // residual connection back into x
-        for i in 0..dim {
-            self.x[i] += self.xb2[i];
-        }
+        accum(&mut self.x, &self.xb2);
     }
     // FFN calculates: self.w2(F.silu(self.w1(x)) * self.w3(x)).
     fn fnn(&mut self, l: usize) {
@@ -207,14 +238,10 @@ impl<'a, W: Llama2Weights> RunState<'a, W> {
         );
 
         // SwiGLU non-linearity
-        for i in 0..hidden_dim {
-            let mut val = self.hb[i];
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= 1.0f32 / (1.0f32 + (-val).exp());
-            // elementwise multiply with w3(x)
-            val *= self.hb2[i];
-            self.hb[i] = val;
-        }
+        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+        silu(&mut self.hb);
+        // elementwise multiply with w3(x)
+        elementwise_mult(&mut self.hb, &self.hb2);
 
         // final matmul to get the output of the ffn
         matmul(
@@ -224,73 +251,6 @@ impl<'a, W: Llama2Weights> RunState<'a, W> {
         );
 
         // residual connection
-        for i in 0..dim {
-            self.x[i] += self.xb[i];
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// neural net blocks; the dynamics of the Transformer
-
-fn rmsnorm_self(o: &mut [f32], weight: &[f32]) {
-    // calculate sum of squares
-    let mut ss = 0.0f32;
-    for v in o.iter() {
-        ss += v * v;
-    }
-    ss /= o.len() as f32;
-    ss += 1e-5f32;
-    ss = 1.0f32 / ss.sqrt();
-    // normalize and scale
-    for j in 0..o.len() {
-        o[j] = weight[j] * (ss * o[j]);
-    }
-}
-
-fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32]) {
-    // calculate sum of squares
-    let mut ss = 0.0f32;
-    for v in x {
-        ss += v * v;
-    }
-    ss /= x.len() as f32;
-    ss += 1e-5f32;
-    ss = 1.0f32 / ss.sqrt();
-    // normalize and scale
-    for j in 0..x.len() {
-        o[j] = weight[j] * (ss * x[j]);
-    }
-}
-
-fn matmul(xout: &mut [f32], x: &[f32], w: &[f32]) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    let n = x.len();
-    for i in 0..xout.len() {
-        let mut val = 0.0f32;
-        for j in 0..x.len() {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
-    }
-}
-fn softmax(x: &mut [f32], size: usize) {
-    // find max value (for numerical stability)
-    let mut max_val = x[0];
-    for i in 1..size {
-        if x[i] > max_val {
-            max_val = x[i];
-        }
-    }
-    // exp and sum
-    let mut sum = 0.0f32;
-    for i in 0..x.len() {
-        x[i] = (x[i] - max_val).exp();
-        sum += x[i];
-    }
-    // normalize
-    for i in 0..size {
-        x[i] /= sum;
+        accum(&mut self.x, &self.xb);
     }
 }

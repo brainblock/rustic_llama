@@ -1,9 +1,14 @@
+use datasize::DataSize;
+
 pub mod config;
-pub mod transformer;
 pub mod run_state;
+pub mod transformer;
 pub(crate) mod weights;
 
-pub trait Llama2Weights {
+pub trait Llama2Weights
+where
+    Self: DataSize,
+{
     fn token_embedding_table(&self) -> &[f32];
     fn rms_att_weight(&self) -> &[f32];
     fn wq(&self) -> &[f32];

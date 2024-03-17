@@ -1,9 +1,11 @@
 use anyhow::Result;
+use datasize::DataSize;
 use memmap2::MmapOptions;
 use std::{fs::File, io::Cursor, path::PathBuf};
 
 use super::{config::Config, run_state::RunState, weights::TransformerWeights};
 
+#[derive(DataSize)]
 pub struct Transformer {
     config: Config,              // the hyperparameters of the architecture (the blueprint)
     weights: TransformerWeights, // the weights of the model

@@ -1,10 +1,11 @@
 use std::io::Read;
 
 use anyhow::Result;
+use datasize::DataSize;
 
 use crate::utils::read_value;
 
-#[derive(Debug)]
+#[derive(Debug, DataSize)]
 pub struct Config {
     pub dim: usize,        // transformer dimension
     pub hidden_dim: usize, // for ffn layers

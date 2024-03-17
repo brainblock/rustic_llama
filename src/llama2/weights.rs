@@ -1,9 +1,11 @@
 use anyhow::Result;
+use datasize::DataSize;
 use memmap2::{Mmap, MmapOptions};
 use std::{fs::File, marker::PhantomData, mem};
 
 use super::{config::Config, Llama2Weights};
 
+#[derive(DataSize)]
 struct MemoryMappedArray<T> {
     start: usize,
     length: usize,
@@ -33,7 +35,15 @@ impl<T> MemoryMappedArray<T> {
         self.start + self.length
     }
 }
+
+fn estimate_third_party_type(_value: &Mmap) -> usize {
+    // memory mapped files consume do not consume heap space
+    0
+}
+
+#[derive(DataSize)]
 pub struct TransformerWeights {
+    #[data_size(with = estimate_third_party_type)]
     mmap: Mmap,
     // token embedding table
     token_embedding_table: MemoryMappedArray<f32>, // (vocab_size, dim)
@@ -111,7 +121,7 @@ impl TransformerWeights {
 }
 
 impl Llama2Weights for TransformerWeights {
-        #[inline]
+    #[inline]
     fn token_embedding_table(&self) -> &[f32] {
         self.token_embedding_table.aligned(self.mmap.as_ref())
     }

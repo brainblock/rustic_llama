@@ -2,15 +2,17 @@ use std::io::Write;
 
 use crate::{sampler::Sampler, tokenizer::Tokenizer, utils::time_in_ms};
 use anyhow::Result;
+use datasize::data_size;
 use rustic_llama::llama2::transformer::Transformer;
 
 pub fn generate(
     transformer: &Transformer,
     tokenizer: &Tokenizer,
-    sampler: &Sampler,
+    sampler: &mut Sampler,
     prompt: Option<&str>,
     steps: usize,
 ) -> Result<()> {
+    use humansize::{format_size, DECIMAL};
     let prompt = prompt.unwrap_or("");
 
     let prompt_tokens = tokenizer.encode(prompt, true, false)?;
@@ -21,16 +23,18 @@ pub fn generate(
     let mut token = prompt_tokens[0usize]; // kick off with the first token in the prompt
     let mut pos = 0usize; // position in the sequence
     let mut state = transformer.create_run_state();
+    let run_state_size = data_size(&state);
+    eprintln!("runstate_size heap: {}", format_size(run_state_size, DECIMAL));
     while pos < steps {
         // forward the transformer to get logits for the next token
-        let logits = state.forward(token, pos);
+        let logits = state.forward(token);
         // advance the state machine
         if pos < prompt_tokens.len() - 1 {
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos + 1];
         } else {
             // otherwise sample the next token from the logits
-            next = sampler.sample(&logits);
+            next = sampler.sample(logits);
         }
         pos += 1;
 
