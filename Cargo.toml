@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = { version = "1.0.79", features = ["backtrace"] }
 bytemuck = "1.14.3"
+clap = { version = "4.5.3", features = ["derive"] }
 datasize = "0.2.15"
 humansize = "2.1.3"
 memmap2 = "0.9.4"
